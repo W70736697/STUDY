@@ -1,0 +1,471 @@
+# 导入系统模块，用于处理系统相关操作，如添加外部库路径
+import sys
+# 将外部库路径添加到系统路径中，以便能够导入相关模块
+sys.path.append('/home/aistudio/external-libraries')
+
+# 从tqdm库导入tqdm，用于在循环中显示进度条
+from tqdm import tqdm
+# 导入pandas库，用于数据处理和分析，如读取和处理CSV文件
+import pandas as pd
+import os
+# 从functools库导入partial，用于创建偏函数，固定函数的部分参数
+from functools import partial
+# 导入numpy库，用于数值计算，如数组操作
+import numpy as np
+import time
+
+# 导入paddle相关库
+import paddle
+import paddle.nn.functional as F
+import paddle.nn as nn
+from paddle.io import DataLoader
+from paddle.dataset.common import md5file
+
+# 导入paddlenlp相关库
+import paddlenlp as ppnlp
+from paddlenlp.transformers import LinearDecayWithWarmup
+from paddlenlp.metrics import ChunkEvaluator
+from paddlenlp.transformers import BertTokenizer, BertPretrainedModel
+from paddlenlp.data import Stack, Tuple, Pad, Dict
+from paddlenlp.datasets import DatasetBuilder, get_path_from_url
+
+# 从paddle.io导入Dataset类，用于自定义数据集
+from paddle.io import Dataset
+
+# 打开训练数据集文件，读取数据并去除文件头和尾行（空行）
+with open('data/train_dataset_v2.tsv', 'r', encoding='utf-8') as handler:
+    lines = handler.read().split('\n')[1:-1]
+
+    data = list()
+    for line in tqdm(lines):
+        sp = line.split('\t')
+        # 检查每行数据是否有4个字段，若不是则打印错误信息并跳过该行
+        if len(sp)!= 4:
+            print("ERROR:", sp)
+            continue
+        data.append(sp)
+
+# 将训练数据转换为DataFrame格式，并设置列名
+train = pd.DataFrame(data)
+train.columns = ['id', 'content', 'character', 'emotions']
+
+# 读取测试数据集和提交示例文件
+test = pd.read_csv('data/test_dataset.tsv', sep='\t')
+submit = pd.read_csv('data/submit_example.tsv', sep='\t')
+
+# 去除训练集中emotions列为空的行
+train = train[train['emotions']!= '']
+
+# 为训练集和测试集添加text列，由content和character列拼接而成
+train['text'] = train['content'].astype(str) + '角色: ' + train['character'].astype(str)
+test['text'] = test['content'].astype(str) + ' 角色: ' + test['character'].astype(str)
+
+# 将训练集的emotions列从字符串转换为整数列表，并分别赋值给各个情感标签列
+train['emotions'] = train['emotions'].apply(lambda x: [int(_i) for _i in x.split(',')])
+train[['love', 'joy', 'fright', 'anger', 'fear', 'sorrow']] = train['emotions'].values.tolist()
+# 初始化测试集的情感标签列为全0
+test[['love', 'joy', 'fright', 'anger', 'fear', 'sorrow']] = [0, 0, 0, 0, 0, 0]
+
+# 将处理后的训练集和测试集保存为新的CSV文件
+train.to_csv('data/train.csv', columns=['id', 'content', 'character', 'text', 'love', 'joy', 'fright', 'anger', 'fear', 'sorrow'],
+            sep='\t',
+            index=False)
+test.to_csv('data/test.csv', columns=['id', 'content', 'character', 'text', 'love', 'joy', 'fright', 'anger', 'fear', 'sorrow'],
+            sep='\t',
+            index=False)
+
+# 定义情感标签列名列表
+target_cols = ['love', 'joy', 'fright', 'anger', 'fear', 'sorrow']
+
+# 预训练模型名称，可在此切换不同模型（当前使用roberta-wwm-ext）
+# PRE_TRAINED_MODEL_NAME = "bert-base-chinese"
+# PRE_TRAINED_MODEL_NAME = 'macbert-base-chinese'
+# PRE_TRAINED_MODEL_NAME = 'macbert-large-chinese'
+# PRE_TRAINED_MODEL_NAME = 'bert-wwm-ext-chinese'
+PRE_TRAINED_MODEL_NAME = 'roberta-wwm-ext'
+
+# 加载预训练模型的分词器
+tokenizer = ppnlp.transformers.RobertaTokenizer.from_pretrained(PRE_TRAINED_MODEL_NAME)
+# 加载预训练模型
+base_model = ppnlp.transformers.RobertaModel.from_pretrained(PRE_TRAINED_MODEL_NAME)
+
+# 定义RoleDataset类，继承自Dataset类
+class RoleDataset(Dataset):
+    def __init__(self, mode='train', trans_func=None):
+        super(RoleDataset, self).__init__()
+        # 根据模式加载相应的数据集（训练集或测试集）
+        if mode == 'train':
+            self.data = pd.read_csv('data/train.csv', sep='\t')
+        else:
+            self.data = pd.read_csv('data/test.csv', sep='\t')
+        # 获取文本数据列表
+        self.texts = self.data['text'].tolist()
+        # 将标签数据转换为字典列表形式
+        self.labels = self.data[target_cols].to_dict('records')
+        self.trans_func = trans_func
+
+    def __getitem__(self, index):
+        text = str(self.texts[index])
+        label = self.labels[index]
+        sample = {
+            'text': text
+        }
+        # 将每个情感标签添加到样本字典中
+        for label_col in target_cols:
+            sample[label_col] = label[label_col]
+        # 对样本进行转换（如果有转换函数）
+        sample = self.trans_func(sample)
+        return sample
+
+    def __len__(self):
+        return len(self.texts)
+
+# 定义函数将文本数据转换为模型输入所需的格式（包括编码和标签处理）
+def convert_example(example, tokenizer, max_seq_length=512, is_test=False):
+    sample = {}
+    # 使用分词器对文本进行编码，获取输入ID和标记类型ID
+    encoded_inputs = tokenizer(text=example["text"], max_seq_len=max_seq_length)
+    sample['input_ids'] = encoded_inputs["input_ids"]
+    sample['token_type_ids'] = encoded_inputs["token_type_ids"]
+
+    # 将情感标签转换为numpy数组（数据类型为float32）
+    sample['love'] = np.array(example["love"], dtype="float32")
+    sample['joy'] = np.array(example["joy"], dtype="float32")
+    sample['anger'] = np.array(example["anger"], dtype="float32")
+    sample['fright'] = np.array(example["fright"], dtype="float32")
+    sample['fear'] = np.array(example["fear"], dtype="float32")
+    sample['sorrow'] = np.array(example["sorrow"], dtype="float32")
+
+return sample
+
+# 设置最大序列长度
+max_seq_length = 128
+# 创建偏函数，固定convert_example函数的部分参数（分词器和最大序列长度）
+trans_func = partial(
+    convert_example,
+    tokenizer=tokenizer,
+    max_seq_length=max_seq_length)
+# 创建训练数据集对象
+train_ds = RoleDataset('train', trans_func)
+# 创建测试数据集对象
+test_ds = RoleDataset('test', trans_func)
+
+# 打印测试数据集的第一个样本（转换后的格式）
+print(test_ds[0])
+
+# 设置训练相关参数
+epochs = 3
+weight_decay = 0.0
+data_path = 'data'
+warmup_proportion = 0.0
+init_from_ckpt = None
+batch_size = 32
+learning_rate = 5e-5
+
+# 定义函数创建数据加载器
+def create_dataloader(dataset,
+                      mode='train',
+                      batch_size=1,
+                      batchify_fn=None):
+    shuffle = True if mode == 'train' else False
+    if mode == 'train':
+        # 创建分布式训练的批次采样器（如果是训练模式）
+        batch_sampler = paddle.io.DistributedBatchSampler(
+            dataset, batch_size=batch_size, shuffle=shuffle)
+    else:
+        # 创建普通的批次采样器（如果是测试模式）
+        batch_sampler = paddle.io.BatchSampler(
+            dataset, batch_size=batch_size, shuffle=shuffle)
+
+    return paddle.io.DataLoader(
+        dataset=dataset,
+        batch_sampler=batch_sampler,
+        collate_fn=batchify_fn,
+        return_list=True)
+
+# 定义函数用于整理批次数据（填充、堆叠等操作）
+def collate_func(batch_data):
+    batch_size = len(batch_data)
+    if batch_size == 0:
+        return {}
+    input_ids_list, attention_mask_list = [], []
+    love_list, joy_list, anger_list = [], [], []
+    fright_list, fear_list, sorrow_list = [], [], []
+    for instance in batch_data:
+        input_ids_temp = instance["input_ids"]
+        attention_mask_temp = instance["token_type_ids"]
+
+        love = instance['love']
+        joy = instance['joy']
+        anger = instance['anger']
+        fright = instance['fright']
+        fear = instance['fear']
+        sorrow = instance['sorrow']
+
+        # 将输入ID和标记类型ID转换为张量并添加到列表中
+        input_ids_list.append(paddle.to_tensor(input_ids_temp, dtype="int64"))
+        attention_mask_list.append(paddle.to_tensor(attention_mask_temp, dtype="int64"))
+
+        # 将情感标签添加到相应列表中
+        love_list.append(love)
+        joy_list.append(joy)
+        anger_list.append(anger)
+        fright_list.append(fright)
+        fear_list.append(fear)
+        sorrow_list.append(sorrow)
+
+    # 对输入ID和标记类型ID进行填充操作
+    return {"input_ids": Pad(pad_val=0, axis=0)(input_ids_list),
+            "token_type_ids": Pad(pad_val=0, axis=0)(attention_mask_list),
+            "love": Stack(dtype="int64")(love_list),
+            "joy": Stack(dtype="int64")(joy_list),
+            "anger": Stack(dtype="int64")(anger_list),
+            "fright": Stack(dtype="int64")(fright_list),
+            "fear": Stack(dtype="int64")(fear_list),
+            "sorrow": Stack(dtype="int64")(sorrow_list),
+            }
+
+# 创建训练数据加载器
+train_data_loader = create_dataloader(
+    train_ds,
+    mode='train',
+    batch_size=batch_size,
+batchify_fn=collate_func)
+
+# 定义情感分类模型类，继承自nn.Layer
+class EmotionClassifier(nn.Layer):
+    def __init__(self, bert, n_classes):
+        super(EmotionClassifier, self).__init__()
+        self.bert = bert
+        # 定义多个线性层用于不同情感的分类预测
+        self.out_love = nn.Linear(self.bert.config["hidden_size"], n_classes)
+        self.out_joy = nn.Linear(self.bert.config["hidden_size"], n_classes)
+        self.out_fright = nn.Linear(self.bert.config["hidden_size"], n_classes)
+        self.out_anger = nn.Linear(self.bert.config["hidden_size"], n_classes)
+        self.out_fear = nn.Linear(self.bert.config["hidden_size"], n_classes)
+        self.out_sorrow = nn.Linear(self.bert.config["hidden_size"], n_classes)
+
+    def forward(self, input_ids, token_type_ids):
+        # 将输入传入预训练模型，获取池化输出
+        _, pooled_output = self.bert(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids
+        )
+        # 通过各个线性层进行情感分类预测
+        love = self.out_love(pooled_output)
+        joy = self.out_joy(pooled_output)
+        fright = self.out_fright(pooled_output)
+        anger = self.out_anger(pooled_output)
+        fear = self.out_fear(pooled_output)
+        sorrow = self.out_sorrow(pooled_output)
+        return {
+            'love': love, 'joy': joy, 'fright': fright,
+            'anger': anger, 'fear': fear, 'sorrow': sorrow,
+        }
+
+# 类别名称列表（这里只有一个类别，但可以根据实际情况扩展）
+class_names = [1]
+# 创建情感分类模型对象
+model = EmotionClassifier(base_model, 4)
+
+# 计算总的训练步数
+num_train_epochs = 3
+num_training_steps = len(train_data_loader) * num_train_epochs
+
+# 定义学习率调度器，使用线性衰减策略
+lr_scheduler = LinearDecayWithWarmup(learning_rate, num_training_steps, 0.0)
+
+# 获取需要进行权重衰减的参数名称列表（排除偏置和LayerNorm参数）
+decay_params = [
+    p.name for n, p in model.named_parameters()
+    if not any(nd in n for nd in ["bias", "norm"])
+]
+
+# 定义优化器（AdamW），并设置学习率、参数、权重衰减和应用权重衰减的参数函数
+optimizer = paddle.optimizer.AdamW(
+    learning_rate=lr_scheduler,
+    parameters=model.parameters(),
+    weight_decay=0.0,
+    apply_decay_param_fun=lambda x: x in decay_params)
+# 定义交叉熵损失函数
+criterion = paddle.nn.loss.CrossEntropyLoss()
+# 定义评估指标为准确率
+metric = paddle.metric.Accuracy()
+
+# 定义训练函数，记录训练损失和准确率并返回
+def do_train(model, data_loader, criterion, optimizer, scheduler, metric):
+    model.train()
+    global_step = 0
+    tic_train = time.time()
+    log_steps = 100
+    train_losses = []  # 记录每个epoch的平均损失
+    train_accuracies = []  # 记录每个epoch的平均准确率
+    for epoch in range(num_train_epochs):
+        losses = []
+        for step, sample in enumerate(data_loader):
+            input_ids = sample["input_ids"]
+            token_type_ids = sample["token_type_ids"]
+            # 将输入传入模型获取预测输出
+            outputs = model(input_ids=input_ids,
+                            token_type_ids=token_type_ids)
+
+            # 计算各种情感的损失
+            loss_love = criterion(outputs['love'], sample['love'])
+            loss_joy = criterion(outputs['joy'], sample['joy'])
+            loss_fright = criterion(outputs['fright'], sample['fright'])
+            loss_anger = criterion(outputs['anger'], sample['anger'])
+            loss_fear = criterion(outputs['fear'], sample['fear'])
+            loss_sorrow = criterion(outputs['sorrow'], sample['sorrow'])
+
+            loss = loss_love + loss_joy + loss_fright + loss_anger + loss_fear + loss_sorrow
+
+            # 计算每个情感标签的准确率并更新评估指标
+            for label_col in target_cols:
+                correct = metric.compute(outputs[label_col], sample[label_col])
+                metric.update(correct)
+
+            acc = metric.accumulate()
+
+            losses.append(loss.numpy())
+            loss.backward()
+            global_step += 1
+            if global_step % log_steps == 0:
+                print("global step %d, epoch: %d, batch: %d, loss: %.5f, accuracy: %.5f, speed: %.2f step/s"
+                      % (global_step, epoch, step, loss, acc,
+                         log_steps / (time.time() - tic_train)))
+
+            optimizer.step()
+            scheduler.step()
+            optimizer.clear_grad()
+
+        metric.reset()
+        # 计算每个epoch的平均损失和准确率
+        epoch_loss = np.mean(losses)
+        train_losses.append(epoch_loss)
+        train_accuracies.append(acc)
+    return train_losses, train_accuracies
+
+# 训练模型并获取训练损失和准确率记录
+train_losses, train_accuracies = do_train(model, train_data_loader, criterion, optimizer, lr_scheduler, metric)
+
+# 绘制训练损失曲线
+plt.plot(range(1, num_train_epochs + 1), train_losses)
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training Loss Curve')
+plt.show()
+
+# 绘制训练准确率曲线
+plt.plot(range(1, num_train_epochs + 1), train_accuracies)
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.title('Training Accuracy Curve')
+plt.show()
+
+# 再次训练模型（可能是为了覆盖之前的训练结果或进行额外的训练，这里可以根据需求调整）
+do_train(model, train_data_loader, criterion, optimizer, lr_scheduler, metric)
+
+# 从collections模块导入defaultdict，用于创建默认值为列表的字典
+from collections import defaultdict
+
+# 使用之前定义的create_dataloader函数创建测试数据加载器
+# 传入测试数据集test_ds，模式为'test'，批大小为batch_size，以及用于整理批次数据的collate_fn函数
+test_data_loader = create_dataloader(
+    test_ds,
+    mode='test',
+    batch_size=batch_size,
+batchify_fn=collate_func)
+
+# 创建一个默认值为列表的字典，用于存储测试预测结果
+test_pred = defaultdict(list)
+# 遍历测试数据加载器，tqdm用于显示进度条
+for step, batch in tqdm(enumerate(test_data_loader)):
+    # 获取批次数据中的输入ID
+    b_input_ids = batch['input_ids']
+    # 获取批次数据中的标记类型ID
+    token_type_ids = batch['token_type_ids']
+    # 将输入传入模型，获取预测的logits
+    logits = model(input_ids=b_input_ids, token_type_ids=token_type_ids)
+    # 遍历每个情感类别列
+    for col in target_cols:
+        # 获取每个情感类别预测的最大概率的类别索引
+        out2 = paddle.argmax(logits[col], axis=1)
+        # 将预测结果添加到对应的情感类别列表中
+        test_pred[col].append(out2.numpy())
+    # 打印当前的测试预测结果（部分预测结果，用于查看格式）
+    print(test_pred)
+    # （可选）打印logits（模型预测的未经过处理的输出，通常是每个类别的概率值）
+    # print(logits)
+    # 只进行一次循环就跳出，这里可能是为了快速查看预测结果的格式，实际使用时可能需要根据需求调整
+break
+
+def predict(model, test_data_loader):
+    val_loss = 0
+    test_pred = defaultdict(list)
+    # 将模型设置为评估模式，关闭梯度计算等训练相关操作
+    model.eval()
+    all_preds = []  # 存储所有预测的类别标签
+    all_labels = []  # 存储所有真实的类别标签
+    # 遍历测试数据加载器
+    for step, batch in tqdm(enumerate(test_data_loader)):
+        b_input_ids = batch['input_ids']
+        token_type_ids = batch['token_type_ids']
+
+        with paddle.no_grad():
+            logits = model(input_ids=b_input_ids, token_type_ids=token_type_ids)
+            for col in target_cols:
+                out2 = paddle.argmax(logits[col], axis=1)
+                test_pred[col].extend(out2.numpy().tolist())
+                all_preds.extend(out2.numpy().tolist())
+                all_labels.extend(batch[col].numpy().tolist())
+    return all_preds, all_labels
+
+# 使用定义的predict函数进行预测，获取预测标签和真实标签
+test_preds, test_labels = predict(model, test_data_loader)
+
+# 创建一个4x4的零矩阵，用于存储混淆矩阵（假设类别数量为4，根据实际情况调整）
+confusion_matrix = np.zeros((4, 4))
+# 遍历预测结果和真实标签，计算混淆矩阵的值
+for i in range(len(test_preds)):
+confusion_matrix[test_labels[i]][test_preds[i]] += 1
+
+# 设置图形大小
+plt.figure(figsize=(8, 6))
+# 使用seaborn绘制混淆矩阵，annot=True表示在矩阵中显示数值，fmt='d'表示以整数格式显示，cmap='Blues'表示使用蓝色系颜色映射
+sns.heatmap(confusion_matrix, annot=True, fmt='d', cmap='Blues')
+# 设置x轴标签
+plt.xlabel('Predicted')
+# 设置y轴标签
+plt.ylabel('True')
+# 设置图形标题
+plt.title('Confusion Matrix')
+# 显示图形
+plt.show()
+
+# 读取提交示例文件
+submit = pd.read_csv('data/submit_example.tsv', sep='\t')
+# 使用predict函数进行预测，获取预测结果
+test_pred = predict(model, test_data_loader)
+
+# 打印预测结果中'love'情感类别的前10个预测值
+print(test_pred['love'][:10])
+# 打印预测结果中'love'情感类别的长度
+print(len(test_pred['love']))
+
+label_preds = []
+# 遍历每个情感类别列，将预测结果添加到label_preds列表中
+for col in target_cols:
+    preds = test_pred[col]
+    label_preds.append(preds)
+# 打印预测结果中第一个情感类别列表的长度（假设所有情感类别列表长度相同）
+print(len(label_preds[0]))
+
+sub = submit.copy()
+# 将预测结果按列堆叠，转换为适合提交格式的列表
+sub['emotion'] = np.stack(label_preds, axis=1).tolist()
+# 将列表中的元素转换为字符串，用逗号连接
+sub['emotion'] = sub['emotion'].apply(lambda x: ','.join([str(i) for i in x]))
+# 将处理后的提交数据保存为新的文件，文件名包含预训练模型名称
+sub.to_csv('baseline_{}.tsv'.format(PRE_TRAINED_MODEL_NAME), sep='\t', index=False)
+# 显示保存后的提交数据的前几行（默认前5行）
+sub.head()
